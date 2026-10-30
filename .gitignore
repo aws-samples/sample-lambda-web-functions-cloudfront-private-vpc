@@ -1,0 +1,19 @@
+.aws-sam/
+samconfig.toml
+*.zip
+*.pkg
+node_modules/
+src/node_modules/
+.DS_Store
+.vscode/
+.idea/
+.claude/
+npm-debug.log*
+
+# Local threat model artifacts (not part of the published sample)
+.threatmodel/
+
+# Security review evidence (attached to the PCSR ticket, not part of the sample)
+detect-secrets-report.json
+license-summary.txt
+license-report.csv

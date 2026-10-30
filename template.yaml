@@ -1,0 +1,579 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS Lambda Web Functions reference architecture (sample, non-production): a Web Function
+  behind Amazon CloudFront with Origin Access Control, reaching private VPC resources through
+  a Lambda network connector. Example private resource: Amazon Aurora Serverless v2
+  (PostgreSQL) with IAM database authentication.
+
+Parameters:
+  CodeBucket:
+    Type: String
+    Description: >
+      Name of the Amazon S3 bucket that holds the Web Function .zip deployment package.
+      The bucket must have versioning enabled (Lambda requires it). Use a bucket dedicated
+      to this stack: the stack attaches a bucket policy that replaces any existing one.
+  CodeKey:
+    Type: String
+    Default: web-function/app.zip
+    Description: S3 object key for the Web Function .zip deployment package.
+  CodeVersionId:
+    Type: String
+    Default: ''
+    Description: >
+      S3 object version ID of the deployment package. Pin this so each revision maps to an
+      immutable artifact. Leave blank to use the latest version.
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    Description: CIDR block for the VPC the stack creates.
+  DatabaseName:
+    Type: String
+    Default: appdb
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,62}$'
+    Description: Name of the initial database created in the Aurora cluster.
+  DbMinCapacity:
+    Type: Number
+    Default: 0.5
+    Description: Minimum Aurora Serverless v2 capacity in ACUs.
+  DbMaxCapacity:
+    Type: Number
+    Default: 2
+    Description: Maximum Aurora Serverless v2 capacity in ACUs.
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: Number of days Aurora keeps automated backups.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Number of days to keep CloudWatch Logs for the Web Function and setup function.
+
+Conditions:
+  HasCodeVersion: !Not [!Equals [!Ref CodeVersionId, '']]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Networking: a VPC with two private subnets and no internet route. The
+  # connector replaces the Web Function's default outbound path, so the app's
+  # only reachable destination is the database. That's all it needs: the IAM
+  # auth token is signed locally, without calling any AWS API.
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true     # resolve the Aurora endpoint from the connector ENIs
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-a"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-b"
+
+  # The connector may send only PostgreSQL to the database, and the database
+  # accepts traffic only from the connector. Rules are separate resources so the
+  # two groups can reference each other without a dependency cycle.
+  ConnectorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web Function network connector ENIs (egress to Aurora only)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        # Placeholder that replaces the default allow-all egress rule.
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 127.0.0.1/32
+          Description: Removes the default allow-all egress rule
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora cluster (PostgreSQL from the Web Function connector only)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        # Aurora doesn't initiate outbound connections. Replace the default
+        # allow-all egress rule so this group matches the connector group.
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 127.0.0.1/32
+          Description: Removes the default allow-all egress rule
+
+  ConnectorToDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ConnectorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+      Description: PostgreSQL to Aurora
+
+  DatabaseFromConnectorIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ConnectorSecurityGroup
+      Description: PostgreSQL from the Web Function connector
+
+  # ---------------------------------------------------------------------------
+  # Data tier: Aurora Serverless v2 (PostgreSQL).
+  # - IAM database authentication: the app has no stored password.
+  # - The master password is generated by RDS and kept in Secrets Manager for
+  #   administrators and the one-time setup function. The app can't read it.
+  # - The Data API lets the setup function run SQL over HTTPS, outside the VPC.
+  # ---------------------------------------------------------------------------
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the Aurora cluster
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    # Sample stack: delete the cluster (no final snapshot) on stack deletion so it
+    # stops billing. Change to Snapshot or Retain for anything holding real data.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: appadmin
+      ManageMasterUserPassword: true
+      EnableIAMDatabaseAuthentication: true
+      EnableHttpEndpoint: true
+      StorageEncrypted: true
+      DeletionProtection: false
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      CopyTagsToSnapshot: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref DbMinCapacity
+        MaxCapacity: !Ref DbMaxCapacity
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DatabaseCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+
+  # ---------------------------------------------------------------------------
+  # One-time database setup (custom resource). Creates the least-privilege
+  # app_user, grants it IAM authentication, and creates the visits table that
+  # app_user can only read from and insert into. Idempotent; safe to re-run.
+  # ---------------------------------------------------------------------------
+  DatabaseSetupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Creates the IAM-authenticated app user and schema through the RDS Data API
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: rds-data:ExecuteStatement
+              Resource: !GetAtt DatabaseCluster.DBClusterArn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !GetAtt DatabaseCluster.MasterUserSecret.SecretArn
+      InlineCode: |
+        import json, time, urllib.request
+        import boto3
+
+        rds = boto3.client("rds-data")
+
+        def statements(db):
+            return [
+                "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_user') "
+                "THEN CREATE ROLE app_user LOGIN; END IF; END $$",
+                "GRANT rds_iam TO app_user",
+                f'GRANT CONNECT ON DATABASE "{db}" TO app_user',
+                "GRANT USAGE ON SCHEMA public TO app_user",
+                "CREATE TABLE IF NOT EXISTS visits (id BIGSERIAL PRIMARY KEY, "
+                "visited_at TIMESTAMPTZ NOT NULL DEFAULT now(), viewer_location TEXT)",
+                # Adds the column to tables created by an earlier version of this stack.
+                "ALTER TABLE visits ADD COLUMN IF NOT EXISTS viewer_location TEXT",
+                "GRANT SELECT, INSERT ON visits TO app_user",
+                "GRANT USAGE ON SEQUENCE visits_id_seq TO app_user",
+            ]
+
+        def run(props, sql):
+            # The cluster can still be warming up right after creation; retry.
+            for attempt in range(10):
+                try:
+                    return rds.execute_statement(resourceArn=props["ClusterArn"],
+                        secretArn=props["SecretArn"], database=props["DatabaseName"], sql=sql)
+                except Exception as err:
+                    if attempt == 9:
+                        raise
+                    print(f"retry {attempt + 1}: {err}")
+                    time.sleep(15)
+
+        def send(event, context, status, reason=""):
+            body = json.dumps({
+                "Status": status,
+                "Reason": reason or f"See CloudWatch log stream {context.log_stream_name}",
+                "PhysicalResourceId": event.get("PhysicalResourceId", "app-user-setup"),
+                "StackId": event["StackId"], "RequestId": event["RequestId"],
+                "LogicalResourceId": event["LogicalResourceId"],
+            }).encode()
+            req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                headers={"Content-Type": "", "Content-Length": str(len(body))})
+            urllib.request.urlopen(req, timeout=15)
+
+        def handler(event, context):
+            try:
+                if event["RequestType"] in ("Create", "Update"):
+                    props = event["ResourceProperties"]
+                    for sql in statements(props["DatabaseName"]):
+                        run(props, sql)
+                send(event, context, "SUCCESS")
+            except Exception as err:
+                print(f"FAILED: {err}")
+                send(event, context, "FAILED", str(err)[:500])
+
+  DatabaseSetupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${DatabaseSetupFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  DatabaseSetup:
+    Type: Custom::DatabaseAppUser
+    DependsOn:
+      - DatabaseInstance
+      - DatabaseSetupLogGroup
+    Properties:
+      ServiceToken: !GetAtt DatabaseSetupFunction.Arn
+      ClusterArn: !GetAtt DatabaseCluster.DBClusterArn
+      SecretArn: !GetAtt DatabaseCluster.MasterUserSecret.SecretArn
+      DatabaseName: !Ref DatabaseName
+      SchemaVersion: '2'   # bump to re-run the setup SQL on a stack update
+
+  # ---------------------------------------------------------------------------
+  # Compute: the Lambda Web Function, its revision, and its IamAuth endpoint.
+  # ---------------------------------------------------------------------------
+
+  # Lambda reads the .zip from S3 as the lambda.amazonaws.com service principal
+  # when it creates a revision. Scoped to this stack's revisions to prevent a
+  # confused deputy.
+  CodeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CodeBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaWebFunctionCodeAccess
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${CodeBucket}/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:web-function/${AWS::StackName}-web-function/revision/*"
+
+  # The app can connect to this one cluster as app_user, and nothing else.
+  WebFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: connect-as-app-user
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: rds-db:connect
+                Resource: !Sub "arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DatabaseCluster.DBClusterResourceId}/app_user"
+
+  # Operator role Lambda assumes to manage the connector's ENIs. Matches the
+  # policy in the Lambda Developer Guide.
+  NetworkConnectorOperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: manage-enis
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CreateENI
+                Effect: Allow
+                Action: ec2:CreateNetworkInterface
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+              - Sid: TagENI
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  StringEquals:
+                    ec2:ManagedResourceOperator: network-connectors.lambda.amazonaws.com
+
+  NetworkConnector:
+    Type: AWS::Lambda::NetworkConnector
+    Properties:
+      Name: !Sub "${AWS::StackName}-connector"
+      OperatorRole: !GetAtt NetworkConnectorOperatorRole.Arn
+      Configuration:
+        VpcEgressConfiguration:
+          AssociatedComputeResourceTypes:
+            - WebFunction
+          NetworkProtocol: IPv4
+          SubnetIds:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
+          SecurityGroupIds:
+            - !Ref ConnectorSecurityGroup
+
+  WebFunction:
+    Type: AWS::Lambda::WebFunction
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-web-function"
+      Tags:
+        - Key: sample
+          Value: sample-lambda-web-functions-cloudfront-private-vpc
+
+  # Lambda would otherwise create these with no expiration on first run.
+  WebFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/web/${AWS::StackName}-web-function"
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebFunctionLocalLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/web/${AWS::StackName}-web-function.local"
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebFunctionRevision:
+    Type: AWS::Lambda::WebFunctionRevision
+    # Code must be readable, the database user must exist, and the log groups must
+    # exist (so Lambda doesn't create them without retention) before the revision.
+    DependsOn:
+      - CodeBucketPolicy
+      - DatabaseSetup
+      - WebFunctionLogGroup
+      - WebFunctionLocalLogGroup
+    Properties:
+      FunctionName: !Ref WebFunction
+      Description: Web app with private egress to Aurora through a network connector.
+      BuildConfig:
+        CodeConfig:
+          S3Object:
+            Bucket: !Ref CodeBucket
+            Key: !Ref CodeKey
+            VersionId: !If [HasCodeVersion, !Ref CodeVersionId, !Ref "AWS::NoValue"]
+        RuntimeConfig:
+          Runtime: nodejs24.x
+      ServiceConfig:
+        ExecutionRoleArn: !GetAtt WebFunctionExecutionRole.Arn
+        TimeoutSeconds: 30
+        MaxConcurrencyPerEnvironment: 64
+        # A revision with a network connector supports only HomeRegion endpoints.
+        EgressNetworkConnectorArn: !GetAtt NetworkConnector.LatestVersionArn
+        EnvironmentVariables:
+          APP_NAME: sample-lambda-web-functions-cloudfront-private-vpc
+          DB_HOST: !GetAtt DatabaseCluster.Endpoint.Address
+          DB_PORT: !GetAtt DatabaseCluster.Endpoint.Port
+          DB_NAME: !Ref DatabaseName
+          DB_USER: app_user
+          DB_REGION: !Ref AWS::Region
+
+  # IamAuth: only signed requests are accepted, and the resource policy below
+  # grants invoke permission to this stack's CloudFront distribution only.
+  WebFunctionEndpoint:
+    Type: AWS::Lambda::WebFunctionEndpoint
+    Properties:
+      FunctionName: !Ref WebFunction
+      EndpointName: !Sub "${AWS::StackName}-endpoint"
+      EndpointType: HomeRegion
+      AuthType: IamAuth
+      RevisionWeights:
+        - RevisionId: !GetAtt WebFunctionRevision.RevisionId
+          Weight: 100
+      # Caps that protect the database from a traffic spike. With a pool of 5 per
+      # environment, MaxEnvironments 10 limits the fleet to about 50 connections.
+      ScalingConfig:
+        MaxEnvironments: 10
+      ThrottleConfig:
+        RateLimit: 100
+
+  # ---------------------------------------------------------------------------
+  # Edge: CloudFront with Origin Access Control.
+  # ---------------------------------------------------------------------------
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always-amz-auth
+        SigningProtocol: sigv4
+
+  # Caching is off because every request records a visit. If you adapt this for
+  # read-heavy pages, add a separate cache behavior with a real TTL.
+  CachingDisabledPolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${AWS::StackName}-no-cache"
+        DefaultTTL: 0
+        MinTTL: 0
+        MaxTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingBrotli: false
+          EnableAcceptEncodingGzip: false
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  # Forward only the headers the app uses: CloudFront's viewer-location headers.
+  # The viewer's Host header is never forwarded, because Lambda routes on Host and
+  # returns 404 if it isn't the endpoint domain.
+  OriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request"
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - CloudFront-Viewer-Country
+            - CloudFront-Viewer-City
+        # The app reads no cookies or query strings, so none are forwarded.
+        CookiesConfig:
+          CookieBehavior: none
+        QueryStringsConfig:
+          QueryStringBehavior: none
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_All
+        Origins:
+          - Id: WebFunctionOrigin
+            DomainName: !GetAtt WebFunctionEndpoint.DomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: WebFunctionOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          # The app only serves GET pages, so reject other methods at the edge.
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachePolicyId: !Ref CachingDisabledPolicy
+          OriginRequestPolicyId: !Ref OriginRequestPolicy
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          # Takes effect only with a custom domain and ACM certificate. With the
+          # default CloudFront certificate, CloudFront applies its own TLS policy.
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  # Web Functions don't support AWS::Lambda::Permission. Their resource policy is
+  # AWS::Lambda::ResourcePolicy, attached to the Web Function and scoped to this
+  # distribution with aws:SourceArn.
+  EndpointInvokePolicy:
+    Type: AWS::Lambda::ResourcePolicy
+    Properties:
+      ResourceArn: !GetAtt WebFunction.FunctionArn
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: lambda:InvokeWebFunctionEndpoint
+            Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:web-function/${AWS::StackName}-web-function/endpoint/${AWS::StackName}-endpoint"
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+Outputs:
+  AppUrl:
+    Description: Open this URL in a browser to use the app.
+    Value: !Sub "https://${Distribution.DomainName}/"
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID.
+    Value: !Ref Distribution
+  WebFunctionEndpointDomain:
+    Description: Web Function endpoint domain. Direct, unsigned requests are denied.
+    Value: !GetAtt WebFunctionEndpoint.DomainName
+  DatabaseEndpoint:
+    Description: Aurora cluster endpoint (private, reachable only from inside the VPC).
+    Value: !GetAtt DatabaseCluster.Endpoint.Address
+  DatabaseAdminSecretArn:
+    Description: Master user credentials for administrators. The app doesn't use or have access to this secret.
+    Value: !GetAtt DatabaseCluster.MasterUserSecret.SecretArn
+  NetworkConnectorLatestVersionArn:
+    Description: Version-qualified network connector ARN referenced by the revision.
+    Value: !GetAtt NetworkConnector.LatestVersionArn
